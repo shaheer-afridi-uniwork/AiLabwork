@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -663,6 +664,32 @@ def parse_ai_json(raw: str | None, valid_names: set[str]) -> dict[str, Any]:
     }
 
 
+def _generate_with_retry(client: Any, model: str, prompt: str, config: Any, attempts: int = 4) -> Any:
+    """Call Gemini, retrying transient overload/rate-limit errors with exponential backoff."""
+    for i in range(attempts):
+        try:
+            return client.models.generate_content(model=model, contents=prompt, config=config)
+        except Exception as exc:  # noqa: BLE001 - the SDK raises several error types
+            transient = any(code in str(exc) for code in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
+            if i == attempts - 1 or not transient:
+                raise
+            time.sleep(2 * 2**i)  # 2s, 4s, 8s
+
+
+def friendly_ai_error(exc: Exception) -> str:
+    text = str(exc)
+    if any(code in text for code in ("503", "UNAVAILABLE")):
+        return ("Gemini is overloaded right now (503). Your scores are unaffected. "
+                "Use 'Retry AI review' in a minute, or try a different model in the sidebar.")
+    if any(code in text for code in ("429", "RESOURCE_EXHAUSTED")):
+        return "Gemini rate limit or quota reached (429). Wait a minute and retry, or check your quota."
+    if any(code in text for code in ("401", "403", "API key", "API_KEY")):
+        return "Gemini rejected the API key. Check the key in the sidebar."
+    if "404" in text or "NOT_FOUND" in text:
+        return "Gemini model not found. Check the model name in the sidebar."
+    return f"AI review unavailable: {text[:200]}"
+
+
 def analyze_with_gemini(api_key: str, model: str, results: list[dict[str, Any]]) -> dict[str, Any]:
     """One Gemini call for the whole portfolio (retries once on bad JSON)."""
     from google import genai
@@ -678,7 +705,7 @@ def analyze_with_gemini(api_key: str, model: str, results: list[dict[str, Any]])
 
     last_error: Exception | None = None
     for _ in range(2):
-        response = client.models.generate_content(model=model, contents=prompt, config=config)
+        response = _generate_with_retry(client, model, prompt, config)
         try:
             return parse_ai_json(getattr(response, "text", None), valid)
         except ValueError as exc:
@@ -899,7 +926,7 @@ def main() -> None:
                     try:
                         analysis["ai"] = analyze_with_gemini(gemini_key, model.strip(), analysis["results"])
                     except Exception as exc:  # noqa: BLE001 - AI is optional; keep the scores
-                        analysis["ai_error"] = f"AI review unavailable: {exc}"
+                        analysis["ai_error"] = friendly_ai_error(exc)
             st.session_state["analysis"] = analysis
         except ValueError as exc:
             st.error(str(exc))
@@ -913,6 +940,15 @@ def main() -> None:
     # Results live in session_state so they survive reruns (e.g. clicking Download).
     analysis = st.session_state.get("analysis")
     if analysis:
+        if analysis["ai"] is None and use_ai and gemini_key and model.strip():
+            if st.button("Retry AI review"):
+                with st.spinner("Asking Gemini for a README review..."):
+                    try:
+                        analysis["ai"] = analyze_with_gemini(gemini_key, model.strip(), analysis["results"])
+                        analysis["ai_error"] = ""
+                    except Exception as exc:  # noqa: BLE001
+                        analysis["ai_error"] = friendly_ai_error(exc)
+                st.session_state["analysis"] = analysis
         render_analysis(analysis)
 
 
